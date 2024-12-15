@@ -51,6 +51,10 @@ class Assistant:
         self.temperature = getattr(Config, 'DEFAULT_TEMPERATURE', 0.7)
         self.total_tokens_used = 0
 
+        # Initialize documentation context
+        self.current_file_context = ""
+        self.doc_tool = None  # Will be initialized during tool loading
+
         self.tools = self._load_tools()
 
         # Initialize tool checker
@@ -368,8 +372,14 @@ class Assistant:
         Get a completion from the Anthropic API.
         Handles both text-only and multimodal messages.
         Uses prompt caching to prevent duplication of conversation history.
+        Includes relevant code documentation context when available.
         """
         try:
+            # Include documentation context if available
+            context = ""
+            if self.current_file_context:
+                context = f"\nRelevant code context:\n{self.current_file_context}\n"
+
             response = self.client.beta.prompt_caching.messages.create(
                 model=Config.MODEL,
                 max_tokens=min(
@@ -380,7 +390,7 @@ class Assistant:
                 system=[
                     {
                         "type": "text",
-                        "text": f"{SystemPrompts.DEFAULT}\n\n{SystemPrompts.TOOL_USAGE}",
+                        "text": f"{SystemPrompts.DEFAULT}\n{context}\n{SystemPrompts.TOOL_USAGE}",
                         "cache_control": {"type": "ephemeral"}
                     }
                 ],
