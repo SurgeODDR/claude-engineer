@@ -16,6 +16,7 @@ import logging
 
 from config import Config
 from tools.base import BaseTool
+from tools.toolcheckertool import ToolCheckerTool
 from prompt_toolkit import prompt
 from prompt_toolkit.styles import Style
 from prompts.system_prompts import SystemPrompts
@@ -51,6 +52,9 @@ class Assistant:
         self.total_tokens_used = 0
 
         self.tools = self._load_tools()
+
+        # Initialize tool checker
+        self.toolchecker = ToolCheckerTool()
 
     def _execute_uv_install(self, package_name: str) -> bool:
         """
@@ -262,32 +266,62 @@ class Assistant:
         """
         Given a tool usage request (with tool name and inputs),
         dynamically load and execute the corresponding tool.
+        For toolchecker, uses prompt caching to prevent duplication.
         """
         tool_name = tool_use.name
         tool_input = tool_use.input or {}
         tool_result = None
 
-        try:
-            module = importlib.import_module(f'tools.{tool_name}')
-            tool_instance = self._find_tool_instance_in_module(module, tool_name)
+        def update_system_prompt(current_iteration, max_iterations):
+            """Helper to generate system prompt based on iteration context"""
+            return f"{SystemPrompts.DEFAULT}\nIteration {current_iteration} of {max_iterations}"
 
-            if not tool_instance:
-                tool_result = f"Tool not found: {tool_name}"
+        try:
+            if tool_name == "toolcheckertool":
+                # Special handling for toolchecker with prompt caching
+                current_iteration = len(self.conversation_history) // 2  # Rough estimate of turns
+                max_iterations = Config.MAX_CONVERSATION_TOKENS // (Config.MAX_TOKENS * 2)  # Conservative estimate
+
+                tool_response = self.client.beta.prompt_caching.messages.create(
+                    model=Config.TOOLCHECKERMODEL,
+                    max_tokens=8000,
+                    system=[
+                        {
+                            "type": "text",
+                            "text": update_system_prompt(current_iteration, max_iterations),
+                            "cache_control": {"type": "ephemeral"}
+                        },
+                        {
+                            "type": "text",
+                            "text": json.dumps(self.tools),
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ],
+                    messages=self.conversation_history,
+                    tools=self.tools,
+                    tool_choice={"type": "auto"},
+                    extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
+                )
+                tool_result = self.toolchecker.execute(**tool_input)
             else:
-                # Execute the tool with the provided input
-                try:
-                    result = tool_instance.execute(**tool_input)
-                    # Keep structured data intact
-                    tool_result = result
-                except Exception as exec_err:
-                    tool_result = f"Error executing tool '{tool_name}': {str(exec_err)}"
+                module = importlib.import_module(f'tools.{tool_name}')
+                tool_instance = self._find_tool_instance_in_module(module, tool_name)
+                if not tool_instance:
+                    tool_result = f"Tool not found: {tool_name}"
+                else:
+                    try:
+                        result = tool_instance.execute(**tool_input)
+                        tool_result = result
+                    except Exception as exec_err:
+                        tool_result = f"Error executing tool '{tool_name}': {str(exec_err)}"
+
         except ImportError:
             tool_result = f"Failed to import tool: {tool_name}"
         except Exception as e:
             tool_result = f"Error executing tool: {str(e)}"
 
         # Display tool usage with proper handling of structured data
-        self._display_tool_usage(tool_name, tool_input, 
+        self._display_tool_usage(tool_name, tool_input,
             json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result)
         return tool_result
 
@@ -333,18 +367,27 @@ class Assistant:
         """
         Get a completion from the Anthropic API.
         Handles both text-only and multimodal messages.
+        Uses prompt caching to prevent duplication of conversation history.
         """
         try:
-            response = self.client.messages.create(
+            response = self.client.beta.prompt_caching.messages.create(
                 model=Config.MODEL,
                 max_tokens=min(
                     Config.MAX_TOKENS,
                     Config.MAX_CONVERSATION_TOKENS - self.total_tokens_used
                 ),
                 temperature=self.temperature,
-                tools=self.tools,
+                system=[
+                    {
+                        "type": "text",
+                        "text": f"{SystemPrompts.DEFAULT}\n\n{SystemPrompts.TOOL_USAGE}",
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ],
                 messages=self.conversation_history,
-                system=f"{SystemPrompts.DEFAULT}\n\n{SystemPrompts.TOOL_USAGE}"
+                tools=self.tools,
+                tool_choice={"type": "auto"},
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
             )
 
             # Update token usage based on response usage
@@ -366,7 +409,7 @@ class Assistant:
                     for content_block in response.content:
                         if content_block.type == "tool_use":
                             result = self._execute_tool(content_block)
-                            
+
                             # Handle structured data (like image blocks) vs text
                             if isinstance(result, (list, dict)):
                                 tool_results.append({
@@ -398,8 +441,8 @@ class Assistant:
                     return "Error: No tool content received"
 
             # Final assistant response
-            if (getattr(response, 'content', None) and 
-                isinstance(response.content, list) and 
+            if (getattr(response, 'content', None) and
+                isinstance(response.content, list) and
                 response.content):
                 final_content = response.content[0].text
                 self.conversation_history.append({
