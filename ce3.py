@@ -329,6 +329,36 @@ class Assistant:
 
         self.console.print("---")
 
+    def _check_tool_usage(self, response):
+        """
+        Check tool usage with prompt caching and ephemeral tagging.
+        """
+        try:
+            tool_response = self.client.beta.prompt_caching.messages.create(
+                model=Config.MODEL,
+                max_tokens=8000,
+                system=[
+                    {
+                        "type": "text",
+                        "text": f"{SystemPrompts.DEFAULT}\n\n{SystemPrompts.TOOL_USAGE}",
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "type": "text",
+                        "text": json.dumps(self.tools),
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ],
+                messages=self.conversation_history,
+                tools=self.tools,
+                tool_choice={"type": "auto"},
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
+            )
+            return tool_response
+        except Exception as e:
+            logging.error(f"Error in tool checking: {str(e)}")
+            return None
+
     def _get_completion(self):
         """
         Get a completion from the Anthropic API.
@@ -359,6 +389,11 @@ class Assistant:
 
             if response.stop_reason == "tool_use":
                 self.console.print("\n[bold yellow]  Handling Tool Use...[/bold yellow]\n")
+                
+                # Use tool checker with prompt caching
+                tool_response = self._check_tool_usage(response)
+                if tool_response:
+                    response = tool_response
 
                 tool_results = []
                 if getattr(response, 'content', None) and isinstance(response.content, list):
